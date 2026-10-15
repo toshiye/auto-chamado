@@ -1,0 +1,52 @@
+Executables and Binaries
+
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+autochamados
+
+Config and Sensitive Files (Contains Tokens/Passwords)
+
+config.json
+
+Local State and Cache
+
+processed.json
+
+Context & Archive/Backup Files
+
+context/
+old.txt
+
+OS Generated Files
+
+Windows
+
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+macOS
+
+.DS_Store
+.AppleDouble
+.LSOverride
+
+IDEs and Editors
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+Go Build Output Directories
+
+/vendor/
+/bin/
