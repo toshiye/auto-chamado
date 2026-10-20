@@ -42,26 +42,40 @@ type ChatwootListResponse struct {
 	} `json:"data"`
 }
 
+type ConversationMeta struct {
+	Assignee struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+		Type string `json:"type"`
+	} `json:"assignee"`
+	Sender struct {
+		Name                 string `json:"name"`
+		AdditionalAttributes struct {
+			Description string `json:"description"`
+		} `json:"additional_attributes"`
+	} `json:"sender"`
+}
+
 type Conversation struct {
-	ID        int     `json:"id"`
-	Status    string  `json:"status"`
-	CreatedAt int64   `json:"created_at"`
-	UpdatedAt float64 `json:"updated_at"`
-	Meta      struct {
-		Sender struct {
-			Name                 string `json:"name"`
-			AdditionalAttributes struct {
-				Description string `json:"description"`
-			} `json:"additional_attributes"`
-		} `json:"sender"`
-	} `json:"meta"`
+	ID        int              `json:"id"`
+	Status    string           `json:"status"`
+	CreatedAt int64            `json:"created_at"`
+	UpdatedAt float64          `json:"updated_at"`
+	Meta      ConversationMeta `json:"meta"`
+}
+
+type MessageSender struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"` // "user" ou "agent_bot"
 }
 
 type Message struct {
-	ID          int    `json:"id"`
-	Content     string `json:"content"`
-	MessageType int    `json:"message_type"`
-	CreatedAt   int64  `json:"created_at"`
+	ID          int           `json:"id"`
+	Content     string        `json:"content"`
+	MessageType int           `json:"message_type"`
+	CreatedAt   int64         `json:"created_at"`
+	Sender      MessageSender `json:"sender"`
 }
 
 type ChatwootMessagesResponse struct {
@@ -152,6 +166,12 @@ type Store struct {
 	IDs      map[int]bool
 }
 
+type InitialInteractionInfo struct {
+	HasPreviousAgent bool
+	FirstAgentName   string
+	FirstAgentTime   string
+}
+
 func NewStore(filepath string) (*Store, error) {
 	store := &Store{
 		filepath: filepath,
@@ -204,6 +224,7 @@ func (s *Store) Add(id int) error {
 var (
 	cnpjPattern       = regexp.MustCompile(`\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b`)
 	chatwootIDFromURL = regexp.MustCompile(`/conversations/(\d+)`)
+	nameIntroPattern  = regexp.MustCompile(`(?i)\b(?:meu\s+nome\s+é|me\s+chamo|aqui\s+é|sou\s+a|sou\s+o)\s+([A-Za-zÀ-ÖØ-öø-ÿ]+)`)
 	brTz              *time.Location
 )
 
@@ -244,27 +265,95 @@ func extractCNPJ(conv Conversation, messages []Message) (string, bool) {
 	return "", false
 }
 
+func resolveCustomerName(conv Conversation, messages []Message) string {
+	sortMessagesAscending(messages)
+
+	expectingName := false
+
+	for _, msg := range messages {
+		if msg.MessageType == 2 || strings.TrimSpace(msg.Content) == "" {
+			continue
+		}
+
+		if msg.MessageType == 1 {
+			if strings.Contains(strings.ToLower(msg.Content), "informe seu nome") {
+				expectingName = true
+			}
+			continue
+		}
+
+		if msg.MessageType == 0 {
+			content := strings.TrimSpace(msg.Content)
+
+			if expectingName {
+				words := strings.Fields(content)
+				if len(words) >= 1 && len(words) <= 3 && !regexp.MustCompile(`\d`).MatchString(content) {
+					return strings.Title(strings.ToLower(content))
+				}
+				expectingName = false
+			}
+
+			matches := nameIntroPattern.FindStringSubmatch(content)
+			if len(matches) > 1 {
+				return strings.Title(strings.ToLower(matches[1]))
+			}
+		}
+	}
+
+	fallbackName := strings.TrimSpace(conv.Meta.Sender.Name)
+	if fallbackName != "" {
+		return fallbackName
+	}
+
+	return "Cliente"
+}
+
 func sortMessagesAscending(messages []Message) {
 	sort.Slice(messages, func(i, j int) bool {
 		return messages[i].CreatedAt < messages[j].CreatedAt
 	})
 }
 
-func extractFirstAgentMessageTime(conv Conversation, messages []Message) time.Time {
+func extractFirstAgentMessageTime(conv Conversation, messages []Message) (time.Time, InitialInteractionInfo) {
 	sortMessagesAscending(messages)
 
-	for _, msg := range messages {
-		if strings.TrimSpace(msg.Content) == "" {
+	assigneeID := conv.Meta.Assignee.ID
+	var info InitialInteractionInfo
+
+	var firstHumanMsg *Message
+	var currentAssigneeMsg *Message
+
+	for i := range messages {
+		msg := &messages[i]
+		if strings.TrimSpace(msg.Content) == "" || msg.MessageType != 1 || msg.Sender.Type != "user" {
 			continue
 		}
 
-		if msg.MessageType == 1 {
-			if msg.CreatedAt > 0 {
-				return time.Unix(msg.CreatedAt, 0).In(brTz)
-			}
+		if firstHumanMsg == nil {
+			firstHumanMsg = msg
+		}
+
+		if assigneeID > 0 && msg.Sender.ID == assigneeID && currentAssigneeMsg == nil {
+			currentAssigneeMsg = msg
 		}
 	}
-	return time.Unix(conv.CreatedAt, 0).In(brTz)
+
+	if firstHumanMsg != nil && currentAssigneeMsg != nil && firstHumanMsg.Sender.ID != currentAssigneeMsg.Sender.ID {
+		firstTime := time.Unix(firstHumanMsg.CreatedAt, 0).In(brTz)
+		info.HasPreviousAgent = true
+		info.FirstAgentName = firstHumanMsg.Sender.Name
+		info.FirstAgentTime = firstTime.Format("15:04")
+	}
+
+	if currentAssigneeMsg != nil {
+		return time.Unix(currentAssigneeMsg.CreatedAt, 0).In(brTz), info
+	}
+
+	if firstHumanMsg != nil {
+		return time.Unix(firstHumanMsg.CreatedAt, 0).In(brTz), info
+	}
+
+	return time.Unix(conv.CreatedAt, 0).In(brTz), info
 }
 
 func fetchClientCodeByCNPJ(client *http.Client, cfg Config, cnpj string) (string, bool) {
@@ -413,13 +502,15 @@ func main() {
 
 		log.Printf("[SUCESSO] CNPJ %s localizado na conversa %d. Gerando resumo via LLM...", cnpj, conv.ID)
 
-		llmOut, err := generateLLMDataWithRetry(httpClient, cfg, messages, motivos, redes)
+		effectiveStartTime, interactionInfo := extractFirstAgentMessageTime(conv, messages)
+
+		llmOut, err := generateLLMDataWithRetry(httpClient, cfg, messages, motivos, redes, interactionInfo)
 		if err != nil {
 			log.Printf("[ERRO LLM] Falha ao gerar payload via IA para conversa %d: %v", conv.ID, err)
 			continue
 		}
 
-		ticketPayload := buildTicketPayload(conv, messages, cnpj, codigoCliente, llmOut, cfg)
+		ticketPayload := buildTicketPayload(conv, messages, cnpj, codigoCliente, llmOut, effectiveStartTime, cfg)
 		logPayload(conv.ID, ticketPayload)
 
 		log.Printf("[POST] Enviando chamado ID %d para a API interna...", conv.ID)
@@ -437,7 +528,7 @@ func main() {
 
 		totalCadastrados++
 
-		time.Sleep(18 * time.Second)
+		time.Sleep(3 * time.Second)
 	}
 
 	log.Printf("\n=== PROCESSO DE PRODUÇÃO CONCLUÍDO (%d Chamados Cadastrados) ===", totalCadastrados)
@@ -507,7 +598,10 @@ func syncInternalRange(client *http.Client, cfg Config, store *Store, dataInicio
 func fetchChatwootConversations(client *http.Client, cfg Config, tInicio, tFim time.Time) ([]Conversation, error) {
 	var conversasValidas []Conversation
 	pagina := 1
-	maxPaginas := 100 // Garante varredura completa da janela no Chatwoot
+	maxPaginas := 200
+
+	log.Printf("Buscando conversas no Chatwoot para a janela: %s até %s...",
+		tInicio.Format("2006-01-02 15:04:05"), tFim.Format("2006-01-02 15:04:05"))
 
 	for pagina <= maxPaginas {
 		url := fmt.Sprintf("%s/api/v1/accounts/%d/conversations?team_id=%d&status=resolved&assignee_type=me&page=%d&sort_by=last_activity_at_desc",
@@ -523,7 +617,7 @@ func fetchChatwootConversations(client *http.Client, cfg Config, tInicio, tFim t
 
 		if resp.StatusCode != 200 {
 			resp.Body.Close()
-			return nil, fmt.Errorf("status %d", resp.StatusCode)
+			return nil, fmt.Errorf("status HTTP %d da API do Chatwoot na página %d", resp.StatusCode, pagina)
 		}
 
 		var listResp ChatwootListResponse
@@ -537,23 +631,15 @@ func fetchChatwootConversations(client *http.Client, cfg Config, tInicio, tFim t
 			break
 		}
 
-		passouDaJanela := false
 		for _, c := range listResp.Data.Payload {
 			cTime := time.Unix(c.CreatedAt, 0).In(brTz)
 
-			if cTime.After(tFim) {
-				continue
+			if (cTime.Equal(tInicio) || cTime.After(tInicio)) && (cTime.Equal(tFim) || cTime.Before(tFim)) {
+				conversasValidas = append(conversasValidas, c)
 			}
-
-			if cTime.Before(tInicio) {
-				passouDaJanela = true
-				break
-			}
-
-			conversasValidas = append(conversasValidas, c)
 		}
 
-		if passouDaJanela || len(listResp.Data.Payload) < 20 {
+		if len(listResp.Data.Payload) < 20 {
 			break
 		}
 		pagina++
@@ -685,12 +771,12 @@ func fetchMessages(client *http.Client, cfg Config, conversationID int) ([]Messa
 	return allMessages, nil
 }
 
-func generateLLMDataWithRetry(client *http.Client, cfg Config, messages []Message, motivos []MotivoItem, redes []string) (*LLMOutput, error) {
+func generateLLMDataWithRetry(client *http.Client, cfg Config, messages []Message, motivos []MotivoItem, redes []string, info InitialInteractionInfo) (*LLMOutput, error) {
 	maxRetries := 3
-	backoffDelays := []time.Duration{35 * time.Second, 65 * time.Second, 90 * time.Second}
+	backoffDelays := []time.Duration{15 * time.Second, 30 * time.Second, 45 * time.Second}
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		out, err := generateLLMData(client, cfg, messages, motivos, redes)
+		out, err := generateLLMData(client, cfg, messages, motivos, redes, info)
 		if err == nil {
 			return out, nil
 		}
@@ -708,7 +794,7 @@ func generateLLMDataWithRetry(client *http.Client, cfg Config, messages []Messag
 	return nil, fmt.Errorf("excedido o número máximo de tentativas na LLM devido ao Rate Limit")
 }
 
-func generateLLMData(client *http.Client, cfg Config, messages []Message, motivos []MotivoItem, redes []string) (*LLMOutput, error) {
+func generateLLMData(client *http.Client, cfg Config, messages []Message, motivos []MotivoItem, redes []string, info InitialInteractionInfo) (*LLMOutput, error) {
 	var transcript strings.Builder
 	for _, m := range messages {
 		if m.MessageType == 2 || m.Content == "" {
@@ -716,7 +802,11 @@ func generateLLMData(client *http.Client, cfg Config, messages []Message, motivo
 		}
 		role := "Cliente"
 		if m.MessageType == 1 {
-			role = "Atendente"
+			if m.Sender.Type == "agent_bot" {
+				role = "Bot"
+			} else {
+				role = fmt.Sprintf("Atendente (%s)", m.Sender.Name)
+			}
 		}
 		transcript.WriteString(fmt.Sprintf("%s: %s\n", role, m.Content))
 	}
@@ -738,10 +828,19 @@ func generateLLMData(client *http.Client, cfg Config, messages []Message, motivo
 
 	redesFormatadas := strings.Join(redes, ", ")
 
+	transferInstruction := ""
+	if info.HasPreviousAgent {
+		transferInstruction = fmt.Sprintf(
+			"\n8. REGRA DE TRANSFERÊNCIA: A conversa iniciou com o atendente %s às %s antes de ser transferida. "+
+				"Comece o campo 'descricao' citando essa primeira interação e o que foi tratado antes da transferência (ex: 'Atendimento iniciado por %s às %s onde [resumo da triagem/assunto inicial], sendo posteriormente transferido...').",
+			info.FirstAgentName, info.FirstAgentTime, info.FirstAgentName, info.FirstAgentTime,
+		)
+	}
+
 	systemPrompt := fmt.Sprintf(`Você é um analista de suporte técnico.
 Analise a transcrição do atendimento e retorne ESTRITAMENTE um JSON com este schema:
 {
-  "descricao": "Resumo objetivo do problema e solução aplicada (máx 3 frases)",
+  "descricao": "Resumo objetivo do problema e solução aplicada",
   "motivo": "Nome do primeiro motivo principal",
   "motivos": ["Motivo1", "Motivo2"],
   "assuntos": {
@@ -751,16 +850,17 @@ Analise a transcrição do atendimento e retorne ESTRITAMENTE um JSON com este s
 }
 
 Regras Estritas de Seleção:
-1. MOTIVO REAL DO ATENDIMENTO: O campo "motivo" e "motivos" DEVEM identificar o problema/solicitação real do cliente (ex: "Nota fiscal de saída", "SNGPC", "Atualização do sistema"). NÃO adicione o motivo "Inatividade" se o cliente apresentou uma dúvida ou problema técnico.
-2. ENCERRAMENTO POR INATIVIDADE: Se o atendimento foi encerrado porque o cliente parou de responder (ficou mais de 25/30 minutos inativo ou o atendente informou o encerramento por falta de retorno), mantenha os motivos e assuntos normais do problema do cliente e OBRIGATORIAMENTE adicione no final do texto da "descricao" a frase exata: "Cliente inativo por mais de 30 minutos, conversa encerrada.".
+1. MOTIVO REAL DO ATENDIMENTO: O campo "motivo" e "motivos" DEVEM identificar o problema/solicitação real do cliente. NÃO adicione o motivo "Inatividade" se o cliente apresentou uma dúvida ou problema técnico.
+2. ENCERRAMENTO POR INATIVIDADE: Se o atendimento foi encerrado por falta de retorno após inatividade, adicione no final do texto da "descricao" a frase exata: "Cliente inativo por mais de 30 minutos, conversa encerrada.".
 3. MOTIVO "INATIVIDADE" (EXCEÇÃO): Use o motivo "Inatividade" APENAS se o cliente não tiver apresentado NENHUMA dúvida ou solicitação durante todo o histórico do chat.
 4. MÚLTIPLOS MOTIVOS E ASSUNTOS: Se o cliente tratou de mais de um assunto técnico, inclua todos no array "motivos" e seus respectivos itens em "assuntos".
-5. REGRA DE OURO ("Pedido por Comportamento"): Se a conversa mencionar qualquer interação sobre "Pedido por Comportamento" (oferta, uso, dúvida, agendamento, recusa ou repasse de contato do setor de compras), você DEVE OBRIGATORIAMENTE incluir o motivo "Pedido por Comportamento" no array "motivos" e associar o seu respectivo assunto em "assuntos".
+5. REGRA DE OURO ("Pedido por Comportamento"): Se a conversa mencionar "Pedido por Comportamento" (oferta, uso, dúvida, agendamento, recusa ou repasse de contato do setor de compras), você DEVE OBRIGATORIAMENTE incluir o motivo "Pedido por Comportamento" no array "motivos" e associar o seu respectivo assunto em "assuntos".
 6. Cada assunto retornado DEVE pertencer à lista de assuntos permitidos para aquele motivo específico no catálogo. Se não houver assuntos na lista, retorne [].
 7. "rede": Verifique se o nome do cliente ou o diálogo menciona alguma destas redes: [%s]. Se identificar, retorne o nome exato. Caso contrário, retorne null.
+%s
 
 CATÁLOGO OFICIAL DE MOTIVOS E ASSUNTOS:
-%s`, redesFormatadas, catalogBuilder.String())
+%s`, redesFormatadas, transferInstruction, catalogBuilder.String())
 
 	payload := OpenAIRequest{
 		Model:          cfg.LLMModel,
@@ -804,13 +904,14 @@ CATÁLOGO OFICIAL DE MOTIVOS E ASSUNTOS:
 	return &output, nil
 }
 
-func buildTicketPayload(conv Conversation, messages []Message, cnpj string, codigoCliente string, llmOut *LLMOutput, cfg Config) InternalTicketPayload {
+func buildTicketPayload(conv Conversation, messages []Message, cnpj string, codigoCliente string, llmOut *LLMOutput, effectiveStartTime time.Time, cfg Config) InternalTicketPayload {
 	createdTime := time.Unix(conv.CreatedAt, 0).In(brTz)
 	updatedTime := time.Unix(int64(conv.UpdatedAt), 0).In(brTz)
-	effectiveStartTime := extractFirstAgentMessageTime(conv, messages)
 
 	link := fmt.Sprintf("%s/app/accounts/%d/team/%d/conversations/%d",
 		cfg.ChatwootURL, cfg.ChatwootAccountID, cfg.ChatwootTeamID, conv.ID)
+
+	nomeAtendido := resolveCustomerName(conv, messages)
 
 	var assuntosPayload interface{}
 	if llmOut.Assuntos != nil && len(llmOut.Assuntos) > 0 {
@@ -832,7 +933,7 @@ func buildTicketPayload(conv Conversation, messages []Message, cnpj string, codi
 		ClienteSemCadastro: clienteSemCadastro,
 		CodigoCliente:      codigoCliente,
 		Cnpj:               &cnpj,
-		NomePessoaAtendida: conv.Meta.Sender.Name,
+		NomePessoaAtendida: nomeAtendido,
 		DataAtendimento:    createdTime.Format("2006-01-02"),
 		DataChamado:        createdTime.Format("2006-01-02"),
 		HoraChamado:        createdTime.Format("15:04"),
